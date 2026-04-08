@@ -1,0 +1,12 @@
+[Unit]
+Description=Whisper.cpp SYCL server
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && exec __WHISPER_SERVER__ -m __WHISPER_MODEL__ --port 8178 --no-timestamps --prompt "$(cat __PROMPT_FILE__)"'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

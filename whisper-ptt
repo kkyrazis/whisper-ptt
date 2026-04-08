@@ -1,0 +1,118 @@
+#!/bin/bash
+#
+# whisper-ptt: Push-to-talk speech-to-text that types into the focused app.
+# Toggle on/off with a global hotkey (e.g. Super+V).
+# While active, speak naturally — pauses trigger transcription and typing.
+
+PIDFILE="/tmp/whisper-ptt.pid"
+LOGFILE="/tmp/whisper-ptt.log"
+SERVER="http://127.0.0.1:8178/inference"
+LOCKFILE="/tmp/whisper-ptt.lock"
+
+SILENCE_DURATION="1.0"
+SILENCE_THRESHOLD="2%"
+FIRST_FILE="/tmp/whisper-ptt.first"
+
+if [ -f "$PIDFILE" ] || pgrep -f "whisper-ptt" | grep -v $$ > /dev/null 2>&1; then
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+    pkill -f "rec -q /tmp/whisper-ptt" 2>/dev/null
+    pkill -f "whisper-ptt-indicator" 2>/dev/null
+    pgrep -f "whisper-ptt" | grep -v $$ | xargs -r kill 2>/dev/null
+    sleep 0.5
+    rm -f "$PIDFILE" "$FIRST_FILE" "$LOCKFILE" /tmp/whisper-ptt-*.wav
+    notify-send -t 1000 -a "Whisper PTT" -i audio-input-microphone --hint=int:transient:1 "Whisper PTT" "Stopped"
+    if [ -f "$LOGFILE" ]; then
+        echo "=== Session Metrics ==="
+        cat "$LOGFILE"
+    fi
+    exit 0
+fi
+
+if ! curl -s --max-time 5 "$SERVER" > /dev/null 2>&1; then
+    notify-send -t 3000 -a "Whisper PTT" -i audio-input-microphone --hint=int:transient:1 "Whisper PTT" "Server not running. Start with: systemctl --user start whisper-server"
+    exit 1
+fi
+
+whisper-ptt-indicator &
+notify-send -t 1000 -a "Whisper PTT" -i audio-input-microphone --hint=int:transient:1 "Whisper PTT" "Listening..."
+
+echo $$ > "$PIDFILE"
+echo 1 > "$FIRST_FILE"
+: > "$LOGFILE"
+cleanup() {
+    trap - INT TERM
+    rm -f "$PIDFILE" "$FIRST_FILE" "$LOCKFILE" /tmp/whisper-ptt-*.wav
+    pkill -f "whisper-ptt-indicator" 2>/dev/null
+    pkill -TERM -P $$ 2>/dev/null
+    wait 2>/dev/null
+    exit 0
+}
+trap cleanup INT TERM
+
+process_audio() {
+    local AUDIOFILE="$1"
+    local DURATION
+    DURATION=$(soxi -D "$AUDIOFILE" 2>/dev/null)
+    if (( $(echo "$DURATION < 0.3" | bc -l 2>/dev/null || echo 1) )); then
+        printf "[%s] SKIPPED audio=%.1fs (too short)\n" "$(date +%H:%M:%S)" "$DURATION" >> "$LOGFILE"
+        rm -f "$AUDIOFILE"
+        return
+    fi
+
+    local START_MS=$(($(date +%s%N) / 1000000))
+    local TEXT
+    TEXT=$(curl -s -F "file=@$AUDIOFILE" -F "response_format=text" "$SERVER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local END_MS=$(($(date +%s%N) / 1000000))
+    local LATENCY=$(( END_MS - START_MS ))
+    local LOWER
+    LOWER=$(echo "$TEXT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z ]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    printf "[%s] audio=%.1fs latency=%dms text=\"%s\" cmd=\"%s\"\n" \
+        "$(date +%H:%M:%S)" "$DURATION" "$LATENCY" "$TEXT" "$LOWER" >> "$LOGFILE"
+
+    if [ -n "$TEXT" ]; then
+        (
+            flock 9
+            if [[ "$LOWER" =~ ^(enter|press\ enter|submit|send\ it)$ ]]; then
+                ydotool key 28:1 28:0
+                echo 1 > "$FIRST_FILE"
+            elif [[ "$LOWER" =~ ^(new\ line|newline)$ ]]; then
+                ydotool key 28:1 28:0
+            elif [[ "$LOWER" =~ ^(tab|press\ tab)$ ]]; then
+                ydotool key 15:1 15:0
+            elif [[ "$LOWER" =~ ^(delete|delete\ that|undo|undo\ that)$ ]]; then
+                # Ctrl+Shift+- = Ctrl+_ (undo in Claude Code / readline)
+                ydotool key 29:1 42:1 12:1 12:0 42:0 29:0
+            elif [[ "$LOWER" =~ ^(delete\ line|clear\ line)$ ]]; then
+                # Ctrl+E (end of line) then Ctrl+U (delete to start)
+                ydotool key 29:1 18:1 18:0 29:0
+                sleep 0.05
+                ydotool key 29:1 22:1 22:0 29:0
+            else
+                if [ "$(cat "$FIRST_FILE" 2>/dev/null)" = "1" ]; then
+                    echo 0 > "$FIRST_FILE"
+                else
+                    TEXT=" $TEXT"
+                fi
+                ydotool type --key-delay 2 --key-hold 2 -- "$TEXT"
+            fi
+        ) 9>"$LOCKFILE"
+    fi
+
+    rm -f "$AUDIOFILE"
+}
+
+SEQ=0
+while [ -f "$PIDFILE" ]; do
+    AUDIOFILE="/tmp/whisper-ptt-${SEQ}.wav"
+    SEQ=$((SEQ + 1))
+
+    rec -q "$AUDIOFILE" rate 16k channels 1 silence 1 0.1 "$SILENCE_THRESHOLD" 1 "$SILENCE_DURATION" "$SILENCE_THRESHOLD" 2>/dev/null
+
+    [ ! -f "$PIDFILE" ] && break
+    [ ! -f "$AUDIOFILE" ] && continue
+
+    process_audio "$AUDIOFILE" &
+done
+
+wait
