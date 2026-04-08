@@ -30,6 +30,23 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 echo "Adding user to input, render, video groups..."
 sudo usermod -aG input,render,video "$USER"
 
+# Verify Intel GPU is visible via Level Zero
+echo "Checking for Intel GPU via SYCL/Level Zero..."
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+if ! command -v sycl-ls &>/dev/null; then
+    echo "ERROR: sycl-ls not found. Intel oneAPI may not be installed correctly."
+    exit 1
+fi
+if sycl-ls 2>/dev/null | grep -q "level_zero:gpu"; then
+    echo "  Found Level Zero GPU device"
+else
+    echo "WARNING: No Level Zero GPU detected. SYCL build will fall back to CPU."
+    echo "  Ensure intel-compute-runtime and oneapi-level-zero are installed."
+    echo "  Run 'sycl-ls' to check available devices."
+    read -rp "Continue anyway? [y/N] " CONT
+    [[ "$CONT" =~ ^[Yy]$ ]] || exit 1
+fi
+
 # Init and build whisper.cpp
 echo "Building whisper.cpp with SYCL..."
 cd "$SCRIPT_DIR"
@@ -40,6 +57,19 @@ source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 rm -rf build
 cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build --config Release -j"$(nproc)"
+
+# Verify the build includes SYCL support
+WHISPER_SERVER_BIN="$SCRIPT_DIR/whisper.cpp/build/bin/whisper-server"
+if [ ! -f "$WHISPER_SERVER_BIN" ]; then
+    echo "ERROR: whisper-server binary not found after build."
+    exit 1
+fi
+if ldd "$WHISPER_SERVER_BIN" 2>/dev/null | grep -q "libsycl"; then
+    echo "  whisper-server linked against SYCL libraries"
+else
+    echo "WARNING: whisper-server does not appear to be linked against SYCL."
+    echo "  GPU acceleration may not be available."
+fi
 
 # Download model
 echo "Downloading ${MODEL} model..."
